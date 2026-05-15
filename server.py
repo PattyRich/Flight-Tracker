@@ -234,12 +234,21 @@ def poll_loop():
                 vert_rate = plane[11]
                 on_ground = plane[8]
 
-                operator = (
-                    cached_route.get("airline")
-                    or cached_ac.get("operator")
-                    or plane[2]
-                    or "N/A"
-                )
+                # Sanity check route data.
+                # adsbdb is often wrong for low-altitude local flights.
+                # If neither origin nor destination mentions the home city
+                # AND the plane is below 5000ft, the route is likely garbage.
+                origin      = cached_route.get("origin")
+                destination = cached_route.get("destination")
+                home_city_short = HOME_CITY.split(",")[0].strip().upper()
+                if altitude is not None and altitude < 5000:
+                    route_mentions_home = any(
+                        home_city_short in (s or "").upper()
+                        for s in [origin, destination]
+                    )
+                    if not route_mentions_home:
+                        origin      = None
+                        destination = None
 
                 # ── Arrow bearing ──────────────────────────────────
                 # Step 1: true compass bearing from HOME to the PLANE
@@ -249,6 +258,13 @@ def poll_loop():
                     look_bearing = bearing_to_plane(HOME_LAT, HOME_LON, plane_lat, plane_lon)
                     # Step 2: rotate by screen orientation so 0° = straight ahead for viewer
                     rel_bearing  = (look_bearing - SCREEN_FACES) % 360
+
+                operator = (
+                    cached_route.get("airline")
+                    or cached_ac.get("operator")
+                    or plane[2]
+                    or "N/A"
+                )
 
                 payload = {
                     "callsign":     callsign or "N/A",
@@ -273,8 +289,8 @@ def poll_loop():
                     "manufacturer": cached_ac.get("manufacturer"),
                     "photo_url":    cached_ac.get("photo_url"),
                     "photo_thumb":  cached_ac.get("photo_thumb"),
-                    "origin":       cached_route.get("origin"),
-                    "destination":  cached_route.get("destination"),
+                    "origin":       origin,
+                    "destination":  destination,
                 }
 
                 with lock:
