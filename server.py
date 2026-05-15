@@ -343,5 +343,5 @@ if __name__ == "__main__":
     print(f"Flight tracker running at http://0.0.0.0:5000")
     print(f"Location : {HOME_CITY} ({HOME_LAT}, {HOME_LON})")
     print(f"Interval : {POLL_INTERVAL}s")
-    print(f"Screen   : faces {_VIEWER_FACES_RAW} ({VIEWER_FACES}°)")
+    print(f"Viewer : faces {_VIEWER_FACES_RAW} ({VIEWER_FACES}°)")
     app.run(host="0.0.0.0", port=5000, debug=False)
