@@ -18,10 +18,31 @@ HOME_CITY     = os.getenv("HOME_CITY",        "Austin, TX")
 RADIUS_DEG    = float(os.getenv("RADIUS_DEG", 2.5))
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 60))
 
-TOKEN_URL    = "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token"
-API_URL      = "https://opensky-network.org/api/states/all"
-ADSBDB_AC    = "https://api.adsbdb.com/v0/aircraft/{icao}"
-ADSBDB_CS    = "https://api.adsbdb.com/v0/callsign/{callsign}"
+# SCREEN_FACES: direction the screen physically faces (cardinal or degrees)
+# e.g. NORTH, SW, WEST, 270 — viewer looks the opposite way
+_SCREEN_FACES_RAW = os.getenv("SCREEN_FACES", "NORTH")
+_CARDINAL = {
+    "N": 0,   "NORTH": 0,
+    "NE": 45, "NORTHEAST": 45,
+    "E": 90,  "EAST": 90,
+    "SE": 135,"SOUTHEAST": 135,
+    "S": 180, "SOUTH": 180,
+    "SW": 225,"SOUTHWEST": 225,
+    "W": 270, "WEST": 270,
+    "NW": 315,"NORTHWEST": 315,
+}
+try:
+    SCREEN_FACES = _CARDINAL.get(_SCREEN_FACES_RAW.upper(), None)
+    if SCREEN_FACES is None:
+        SCREEN_FACES = float(_SCREEN_FACES_RAW)
+except ValueError:
+    print(f"[config] invalid SCREEN_FACES '{_SCREEN_FACES_RAW}', defaulting to 0 (North)")
+    SCREEN_FACES = 0
+
+TOKEN_URL = "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token"
+API_URL   = "https://opensky-network.org/api/states/all"
+ADSBDB_AC = "https://api.adsbdb.com/v0/aircraft/{icao}"
+ADSBDB_CS = "https://api.adsbdb.com/v0/callsign/{callsign}"
 
 app = Flask(__name__)
 
@@ -71,6 +92,14 @@ def haversine(lat1, lon1, lat2, lon2):
     a    = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
     return R * 2 * math.asin(math.sqrt(a))
 
+def bearing_to_plane(lat1, lon1, lat2, lon2):
+    """True compass bearing (0-360) from home to the plane's position."""
+    lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+    dlon = lon2 - lon1
+    x = math.sin(dlon) * math.cos(lat2)
+    y = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(dlon)
+    return (math.degrees(math.atan2(x, y)) + 360) % 360
+
 def bearing_to_compass(deg):
     if deg is None:
         return "N/A"
@@ -90,7 +119,6 @@ def vertical_trend(vr):
     return                {"label": "Level",      "symbol": "→"}
 
 def fmt_airport(airport):
-    """Format an airport dict into 'Name (IATA)' string."""
     if not airport:
         return None
     name = airport.get("name") or airport.get("municipality") or None
@@ -130,29 +158,27 @@ def fetch_closest():
 
     return (best, best_dist, remaining) if best else (None, None, remaining)
 
-# ── adsbdb: aircraft lookup by ICAO24 ────────────────────
+# ── adsbdb: aircraft lookup ───────────────────────────────
 def fetch_aircraft(icao24):
-    """Returns aircraft details: model, manufacturer, operator, photo."""
     try:
         r = requests.get(ADSBDB_AC.format(icao=icao24.lower()), timeout=8)
         if r.status_code != 200:
             return {}
         aircraft = r.json().get("response", {}).get("aircraft") or {}
         return {
-            "model":         aircraft.get("type"),
-            "manufacturer":  aircraft.get("manufacturer"),
-            "operator":      aircraft.get("registered_owner"),
-            "registration":  aircraft.get("registration"),
-            "photo_url":     aircraft.get("url_photo"),
-            "photo_thumb":   aircraft.get("url_photo_thumbnail"),
+            "model":        aircraft.get("type"),
+            "manufacturer": aircraft.get("manufacturer"),
+            "operator":     aircraft.get("registered_owner"),
+            "registration": aircraft.get("registration"),
+            "photo_url":    aircraft.get("url_photo"),
+            "photo_thumb":  aircraft.get("url_photo_thumbnail"),
         }
     except Exception as e:
         print(f"[adsbdb aircraft] error: {e}")
         return {}
 
-# ── adsbdb: route lookup by callsign ─────────────────────
+# ── adsbdb: route lookup ──────────────────────────────────
 def fetch_route(callsign):
-    """Returns origin/destination from callsign endpoint."""
     if not callsign or callsign.strip() in ("", "N/A"):
         return {}
     try:
@@ -161,11 +187,9 @@ def fetch_route(callsign):
             print(f"[adsbdb route] {callsign} → HTTP {r.status_code}")
             return {}
         flightroute = r.json().get("response", {}).get("flightroute") or {}
-
-        airline = flightroute.get("airline") or {}
-        origin  = flightroute.get("origin") or {}
-        dest    = flightroute.get("destination") or {}
-
+        airline     = flightroute.get("airline") or {}
+        origin      = flightroute.get("origin") or {}
+        dest        = flightroute.get("destination") or {}
         return {
             "airline":     airline.get("name"),
             "origin":      fmt_airport(origin),
@@ -190,34 +214,41 @@ def poll_loop():
                 icao24   = plane[0]
                 callsign = (plane[1] or "").strip()
 
-                # New aircraft → re-fetch aircraft details
                 if icao24 != last_icao:
                     print(f"[tracker] new aircraft: {icao24} / {callsign}")
-                    cached_ac    = fetch_aircraft(icao24)
-                    last_icao    = icao24
-                    # Reset route cache so it re-fetches for new plane
+                    cached_ac     = fetch_aircraft(icao24)
+                    last_icao     = icao24
                     cached_route  = {}
                     last_callsign = None
 
-                # New callsign → re-fetch route
                 if callsign and callsign != last_callsign:
-                    print(f"[tracker] fetching route for callsign: {callsign}")
+                    print(f"[tracker] fetching route for: {callsign}")
                     cached_route  = fetch_route(callsign)
                     last_callsign = callsign
 
+                plane_lat = plane[6]
+                plane_lon = plane[5]
                 altitude  = meters_to_feet(plane[7])
                 speed     = ms_to_mph(plane[9])
                 heading   = plane[10]
                 vert_rate = plane[11]
                 on_ground = plane[8]
 
-                # Operator: prefer airline name from route, fall back to aircraft owner
                 operator = (
                     cached_route.get("airline")
                     or cached_ac.get("operator")
                     or plane[2]
                     or "N/A"
                 )
+
+                # ── Arrow bearing ──────────────────────────────────
+                # Step 1: true compass bearing from HOME to the PLANE
+                look_bearing = None
+                rel_bearing  = None
+                if plane_lat is not None and plane_lon is not None:
+                    look_bearing = bearing_to_plane(HOME_LAT, HOME_LON, plane_lat, plane_lon)
+                    # Step 2: rotate by screen orientation so 0° = straight ahead for viewer
+                    rel_bearing  = (look_bearing - SCREEN_FACES) % 360
 
                 payload = {
                     "callsign":     callsign or "N/A",
@@ -231,16 +262,17 @@ def poll_loop():
                     "speed_mph":    speed,
                     "heading_deg":  round(heading) if heading else None,
                     "heading_dir":  bearing_to_compass(heading),
+                    "look_bearing": round(look_bearing) if look_bearing is not None else None,
+                    "look_dir":     bearing_to_compass(look_bearing),
+                    "rel_bearing":  round(rel_bearing) if rel_bearing is not None else None,
                     "trend":        vertical_trend(vert_rate),
-                    "lat":          plane[6],
-                    "lon":          plane[5],
-                    # aircraft
+                    "lat":          plane_lat,
+                    "lon":          plane_lon,
                     "operator":     operator,
                     "model":        cached_ac.get("model"),
                     "manufacturer": cached_ac.get("manufacturer"),
                     "photo_url":    cached_ac.get("photo_url"),
                     "photo_thumb":  cached_ac.get("photo_thumb"),
-                    # route
                     "origin":       cached_route.get("origin"),
                     "destination":  cached_route.get("destination"),
                 }
@@ -275,6 +307,7 @@ def api_config():
         "lat":           HOME_LAT,
         "lon":           HOME_LON,
         "poll_interval": POLL_INTERVAL,
+        "screen_faces":  SCREEN_FACES,
     })
 
 @app.route("/api/plane")
@@ -294,4 +327,5 @@ if __name__ == "__main__":
     print(f"Flight tracker running at http://0.0.0.0:5000")
     print(f"Location : {HOME_CITY} ({HOME_LAT}, {HOME_LON})")
     print(f"Interval : {POLL_INTERVAL}s")
+    print(f"Screen   : faces {_SCREEN_FACES_RAW} ({SCREEN_FACES}°)")
     app.run(host="0.0.0.0", port=5000, debug=False)
