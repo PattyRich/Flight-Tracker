@@ -18,9 +18,9 @@ HOME_CITY     = os.getenv("HOME_CITY",        "Austin, TX")
 RADIUS_DEG    = float(os.getenv("RADIUS_DEG", 2.5))
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 60))
 
-# SCREEN_FACES: direction the screen physically faces (cardinal or degrees)
-# e.g. NORTH, SW, WEST, 270 — viewer looks the opposite way
-_SCREEN_FACES_RAW = os.getenv("SCREEN_FACES", "NORTH")
+# VIEWER_FACES: direction the viewer faces when looking at the screen
+# e.g. NORTH means the viewer is facing North.
+_VIEWER_FACES_RAW = os.getenv("VIEWER_FACES", "NORTH")
 _CARDINAL = {
     "N": 0,   "NORTH": 0,
     "NE": 45, "NORTHEAST": 45,
@@ -32,12 +32,12 @@ _CARDINAL = {
     "NW": 315,"NORTHWEST": 315,
 }
 try:
-    SCREEN_FACES = _CARDINAL.get(_SCREEN_FACES_RAW.upper(), None)
-    if SCREEN_FACES is None:
-        SCREEN_FACES = float(_SCREEN_FACES_RAW)
+    VIEWER_FACES = _CARDINAL.get(_VIEWER_FACES_RAW.upper(), None)
+    if VIEWER_FACES is None:
+        VIEWER_FACES = float(_VIEWER_FACES_RAW)
 except ValueError:
-    print(f"[config] invalid SCREEN_FACES '{_SCREEN_FACES_RAW}', defaulting to 0 (North)")
-    SCREEN_FACES = 0
+    print(f"[config] invalid VIEWER_FACES '{_VIEWER_FACES_RAW}', defaulting to 0 (North)")
+    VIEWER_FACES = 0
 
 TOKEN_URL = "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token"
 API_URL   = "https://opensky-network.org/api/states/all"
@@ -257,7 +257,7 @@ def poll_loop():
                 if plane_lat is not None and plane_lon is not None:
                     look_bearing = bearing_to_plane(HOME_LAT, HOME_LON, plane_lat, plane_lon)
                     # Step 2: rotate by screen orientation so 0° = straight ahead for viewer
-                    rel_bearing  = (look_bearing - SCREEN_FACES) % 360
+                    rel_bearing  = (look_bearing - VIEWER_FACES) % 360
 
                 operator = (
                     cached_route.get("airline")
@@ -323,7 +323,7 @@ def api_config():
         "lat":           HOME_LAT,
         "lon":           HOME_LON,
         "poll_interval": POLL_INTERVAL,
-        "screen_faces":  SCREEN_FACES,
+        "VIEWER_FACES":  VIEWER_FACES,
     })
 
 @app.route("/api/plane")
@@ -343,5 +343,5 @@ if __name__ == "__main__":
     print(f"Flight tracker running at http://0.0.0.0:5000")
     print(f"Location : {HOME_CITY} ({HOME_LAT}, {HOME_LON})")
     print(f"Interval : {POLL_INTERVAL}s")
-    print(f"Screen   : faces {_SCREEN_FACES_RAW} ({SCREEN_FACES}°)")
+    print(f"Screen   : faces {_VIEWER_FACES_RAW} ({VIEWER_FACES}°)")
     app.run(host="0.0.0.0", port=5000, debug=False)
