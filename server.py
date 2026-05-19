@@ -17,9 +17,9 @@ HOME_LON      = float(os.getenv("HOME_LON",  -97.7431))
 HOME_CITY     = os.getenv("HOME_CITY",        "Austin, TX")
 RADIUS_DEG    = float(os.getenv("RADIUS_DEG", 2.5))
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 60))
+CACHE_TTL     = 45  # seconds — serve cached data to any browser within this window
 
 # VIEWER_FACES: direction the viewer faces when looking at the screen
-# e.g. NORTH means the viewer is facing North.
 _VIEWER_FACES_RAW = os.getenv("VIEWER_FACES", "NORTH")
 _CARDINAL = {
     "N": 0,   "NORTH": 0,
@@ -45,15 +45,6 @@ ADSBDB_AC = "https://api.adsbdb.com/v0/aircraft/{icao}"
 ADSBDB_CS = "https://api.adsbdb.com/v0/callsign/{callsign}"
 
 app = Flask(__name__)
-
-# ── Shared state ──────────────────────────────────────────
-state = {
-    "plane":        None,
-    "credits":      "?",
-    "last_updated": None,
-    "error":        None,
-}
-lock = threading.Lock()
 
 # ── Token Manager ─────────────────────────────────────────
 class TokenManager:
@@ -82,6 +73,22 @@ class TokenManager:
         return {"Authorization": f"Bearer {self.get_token()}"}
 
 tokens = TokenManager()
+
+# ── On-demand cache ───────────────────────────────────────
+# Holds the last fetch result and enough context to avoid redundant
+# aircraft / route lookups when the plane hasn't changed.
+cache = {
+    "payload":        None,   # full dict returned to the frontend
+    "fetched_at":     0,      # epoch seconds of last successful fetch
+    "last_icao":      None,
+    "last_callsign":  None,
+    "cached_ac":      {},
+    "cached_route":   {},
+    "credits":        "?",
+    "last_updated":   None,
+    "error":          None,
+}
+cache_lock = threading.Lock()
 
 # ── Helpers ───────────────────────────────────────────────
 def haversine(lat1, lon1, lat2, lon2):
@@ -199,117 +206,99 @@ def fetch_route(callsign):
         print(f"[adsbdb route] error: {e}")
         return {}
 
-# ── Background polling thread ─────────────────────────────
-def poll_loop():
-    last_icao     = None
-    last_callsign = None
-    cached_ac     = {}
-    cached_route  = {}
+# ── On-demand fetch (called from /api/plane) ──────────────
+def refresh_cache():
+    """Fetch fresh data from OpenSky + adsbdb and update the cache in-place."""
+    try:
+        plane, dist, credits = fetch_closest()
 
-    while True:
-        try:
-            plane, dist, credits = fetch_closest()
+        if plane:
+            icao24   = plane[0]
+            callsign = (plane[1] or "").strip()
 
-            if plane:
-                icao24   = plane[0]
-                callsign = (plane[1] or "").strip()
+            if icao24 != cache["last_icao"]:
+                print(f"[tracker] new aircraft: {icao24} / {callsign}")
+                cache["cached_ac"]    = fetch_aircraft(icao24)
+                cache["last_icao"]    = icao24
+                cache["cached_route"] = {}
+                cache["last_callsign"] = None
 
-                if icao24 != last_icao:
-                    print(f"[tracker] new aircraft: {icao24} / {callsign}")
-                    cached_ac     = fetch_aircraft(icao24)
-                    last_icao     = icao24
-                    cached_route  = {}
-                    last_callsign = None
+            if callsign and callsign != cache["last_callsign"]:
+                print(f"[tracker] fetching route for: {callsign}")
+                cache["cached_route"]  = fetch_route(callsign)
+                cache["last_callsign"] = callsign
 
-                if callsign and callsign != last_callsign:
-                    print(f"[tracker] fetching route for: {callsign}")
-                    cached_route  = fetch_route(callsign)
-                    last_callsign = callsign
+            plane_lat = plane[6]
+            plane_lon = plane[5]
+            altitude  = meters_to_feet(plane[7])
+            speed     = ms_to_mph(plane[9])
+            heading   = plane[10]
+            vert_rate = plane[11]
+            on_ground = plane[8]
 
-                plane_lat = plane[6]
-                plane_lon = plane[5]
-                altitude  = meters_to_feet(plane[7])
-                speed     = ms_to_mph(plane[9])
-                heading   = plane[10]
-                vert_rate = plane[11]
-                on_ground = plane[8]
-
-                # Sanity check route data.
-                # adsbdb is often wrong for low-altitude local flights.
-                # If neither origin nor destination mentions the home city
-                # AND the plane is below 5000ft, the route is likely garbage.
-                origin      = cached_route.get("origin")
-                destination = cached_route.get("destination")
-                home_city_short = HOME_CITY.split(",")[0].strip().upper()
-                if altitude is not None and altitude < 5000:
-                    route_mentions_home = any(
-                        home_city_short in (s or "").upper()
-                        for s in [origin, destination]
-                    )
-                    if not route_mentions_home:
-                        origin      = None
-                        destination = None
-
-                # ── Arrow bearing ──────────────────────────────────
-                # Step 1: true compass bearing from HOME to the PLANE
-                look_bearing = None
-                rel_bearing  = None
-                if plane_lat is not None and plane_lon is not None:
-                    look_bearing = bearing_to_plane(HOME_LAT, HOME_LON, plane_lat, plane_lon)
-                    # Step 2: rotate by screen orientation so 0° = straight ahead for viewer
-                    rel_bearing  = (look_bearing - VIEWER_FACES) % 360
-
-                operator = (
-                    cached_route.get("airline")
-                    or cached_ac.get("operator")
-                    or plane[2]
-                    or "N/A"
+            origin      = cache["cached_route"].get("origin")
+            destination = cache["cached_route"].get("destination")
+            home_city_short = HOME_CITY.split(",")[0].strip().upper()
+            if altitude is not None and altitude < 5000:
+                route_mentions_home = any(
+                    home_city_short in (s or "").upper()
+                    for s in [origin, destination]
                 )
+                if not route_mentions_home:
+                    origin      = None
+                    destination = None
 
-                payload = {
-                    "callsign":     callsign or "N/A",
-                    "country":      plane[2] or "N/A",
-                    "icao24":       icao24,
-                    "registration": cached_ac.get("registration"),
-                    "on_ground":    on_ground,
-                    "status":       "On Ground" if on_ground else "In Flight",
-                    "distance":     round(dist, 1),
-                    "altitude_ft":  altitude,
-                    "speed_mph":    speed,
-                    "heading_deg":  round(heading) if heading else None,
-                    "heading_dir":  bearing_to_compass(heading),
-                    "look_bearing": round(look_bearing) if look_bearing is not None else None,
-                    "look_dir":     bearing_to_compass(look_bearing),
-                    "rel_bearing":  round(rel_bearing) if rel_bearing is not None else None,
-                    "trend":        vertical_trend(vert_rate),
-                    "lat":          plane_lat,
-                    "lon":          plane_lon,
-                    "operator":     operator,
-                    "model":        cached_ac.get("model"),
-                    "manufacturer": cached_ac.get("manufacturer"),
-                    "photo_url":    cached_ac.get("photo_url"),
-                    "photo_thumb":  cached_ac.get("photo_thumb"),
-                    "origin":       origin,
-                    "destination":  destination,
-                }
+            look_bearing = None
+            rel_bearing  = None
+            if plane_lat is not None and plane_lon is not None:
+                look_bearing = bearing_to_plane(HOME_LAT, HOME_LON, plane_lat, plane_lon)
+                rel_bearing  = (look_bearing - VIEWER_FACES) % 360
 
-                with lock:
-                    state["plane"]        = payload
-                    state["credits"]      = credits
-                    state["last_updated"] = datetime.now().strftime("%H:%M:%S")
-                    state["error"]        = None
-            else:
-                with lock:
-                    state["plane"]        = None
-                    state["credits"]      = credits
-                    state["last_updated"] = datetime.now().strftime("%H:%M:%S")
+            operator = (
+                cache["cached_route"].get("airline")
+                or cache["cached_ac"].get("operator")
+                or plane[2]
+                or "N/A"
+            )
 
-        except Exception as e:
-            print(f"[tracker] error: {e}")
-            with lock:
-                state["error"] = str(e)
+            cache["payload"] = {
+                "callsign":     callsign or "N/A",
+                "country":      plane[2] or "N/A",
+                "icao24":       icao24,
+                "registration": cache["cached_ac"].get("registration"),
+                "on_ground":    on_ground,
+                "status":       "On Ground" if on_ground else "In Flight",
+                "distance":     round(dist, 1),
+                "altitude_ft":  altitude,
+                "speed_mph":    speed,
+                "heading_deg":  round(heading) if heading else None,
+                "heading_dir":  bearing_to_compass(heading),
+                "look_bearing": round(look_bearing) if look_bearing is not None else None,
+                "look_dir":     bearing_to_compass(look_bearing),
+                "rel_bearing":  round(rel_bearing) if rel_bearing is not None else None,
+                "trend":        vertical_trend(vert_rate),
+                "lat":          plane_lat,
+                "lon":          plane_lon,
+                "operator":     operator,
+                "model":        cache["cached_ac"].get("model"),
+                "manufacturer": cache["cached_ac"].get("manufacturer"),
+                "photo_url":    cache["cached_ac"].get("photo_url"),
+                "photo_thumb":  cache["cached_ac"].get("photo_thumb"),
+                "origin":       origin,
+                "destination":  destination,
+            }
+        else:
+            cache["payload"] = None
 
-        time.sleep(POLL_INTERVAL)
+        cache["credits"]      = credits
+        cache["last_updated"] = datetime.now().strftime("%H:%M:%S")
+        cache["error"]        = None
+
+    except Exception as e:
+        print(f"[tracker] error: {e}")
+        cache["error"] = str(e)
+
+    cache["fetched_at"] = time.time()
 
 # ── Flask routes ──────────────────────────────────────────
 @app.route("/")
@@ -328,20 +317,27 @@ def api_config():
 
 @app.route("/api/plane")
 def api_plane():
-    with lock:
+    with cache_lock:
+        age = time.time() - cache["fetched_at"]
+        if age >= CACHE_TTL:
+            # Cache is stale — fetch fresh data before responding
+            print(f"[cache] stale ({age:.0f}s old), refreshing …")
+            refresh_cache()
+        else:
+            print(f"[cache] hit ({age:.0f}s old, TTL={CACHE_TTL}s)")
+
         return jsonify({
-            "plane":        state["plane"],
-            "credits":      state["credits"],
-            "last_updated": state["last_updated"],
-            "error":        state["error"],
+            "plane":        cache["payload"],
+            "credits":      cache["credits"],
+            "last_updated": cache["last_updated"],
+            "error":        cache["error"],
         })
 
 # ── Entry point ───────────────────────────────────────────
 if __name__ == "__main__":
-    t = threading.Thread(target=poll_loop, daemon=True)
-    t.start()
     print(f"Flight tracker running at http://0.0.0.0:5000")
     print(f"Location : {HOME_CITY} ({HOME_LAT}, {HOME_LON})")
-    print(f"Interval : {POLL_INTERVAL}s")
-    print(f"Viewer : faces {_VIEWER_FACES_RAW} ({VIEWER_FACES}°)")
+    print(f"Interval : {POLL_INTERVAL}s (frontend-driven)")
+    print(f"Cache TTL: {CACHE_TTL}s")
+    print(f"Viewer   : faces {_VIEWER_FACES_RAW} ({VIEWER_FACES}°)")
     app.run(host="0.0.0.0", port=5000, debug=False)
